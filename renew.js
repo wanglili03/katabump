@@ -203,6 +203,28 @@ function getUsers() {
     }
 }
 
+function ensurePhotoDir() {
+    const photoDir = path.join(__dirname, 'photo');
+    if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
+    return photoDir;
+}
+
+function safeFileName(value) {
+    return String(value || 'unknown').replace(/[^a-z0-9]/gi, '_');
+}
+
+async function saveScreenshot(page, fileName) {
+    const screenshotPath = path.join(ensurePhotoDir(), fileName);
+    try {
+        await page.screenshot({ path: screenshotPath, fullPage: true });
+        console.log(`Saved screenshot to: ${screenshotPath}`);
+        return screenshotPath;
+    } catch (e) {
+        console.log('Failed to take screenshot:', e.message);
+        return null;
+    }
+}
+
 /**
  * 核心功能：遍历所有 Frames，查找被注入脚本标记的 Turnstile 坐标，
  * 计算绝对屏幕坐标，并使用 CDP 发送原生鼠标点击事件。
@@ -515,7 +537,7 @@ async function attemptTurnstileCdp(page) {
                         await confirmBtn.click();
 
                         try {
-                            // 1. Check for "Please complete the captcha" error
+                            // 1. Check for captcha errors
                             const startVerifyTime = Date.now();
                             while (Date.now() - startVerifyTime < 3000) {
                                 // A. Captcha Error
