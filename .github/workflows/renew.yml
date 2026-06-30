@@ -6,24 +6,43 @@ on:
     - cron: '0 0 * * *'
   workflow_dispatch: # 允许手动触发
 
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 jobs:
   renew:
     runs-on: ubuntu-latest
     
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     
     - name: Setup Node.js
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@v5
       with:
-        node-version: '20'
-        
+        node-version: '26'
+
     - name: Install Dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y xvfb
         npm install
-        npx playwright install-deps chrome
+        npx playwright install chromium
+        npx playwright install-deps chromium
+
+    - name: Diagnose Chrome
+      run: |
+        which google-chrome || true
+        which google-chrome-stable || true
+        which chromium || true
+        which chromium-browser || true
+        ls -l /usr/bin/google-chrome* /usr/bin/chromium* 2>/dev/null || true
+        google-chrome --version || true
+        google-chrome-stable --version || true
+        chromium --version || true
+        node -e "const { chromium } = require('playwright'); console.log('Playwright Chromium:', chromium.executablePath())"
       
     - name: Run Renew Script
       env:
@@ -36,9 +55,21 @@ jobs:
       # 使用 xvfb-run 模拟有头环境运行
       run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node action_renew.js
 
-    - name: Upload Screenshots
+    - name: Persist renewal date cache
       if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: screenshots
-        path: screenshots/
+      run: |
+        if [ ! -f .renewal-cache.json ]; then
+          echo "No renewal cache to persist."
+          exit 0
+        fi
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add -f .renewal-cache.json
+        if git diff --cached --quiet; then
+          echo "Renewal cache unchanged."
+          exit 0
+        fi
+        git commit -m "Update renewal date cache"
+        git pull --rebase
+        git push
+

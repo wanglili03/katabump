@@ -203,6 +203,28 @@ function getUsers() {
     }
 }
 
+function ensurePhotoDir() {
+    const photoDir = path.join(__dirname, 'photo');
+    if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
+    return photoDir;
+}
+
+function safeFileName(value) {
+    return String(value || 'unknown').replace(/[^a-z0-9]/gi, '_');
+}
+
+async function saveScreenshot(page, fileName) {
+    const screenshotPath = path.join(ensurePhotoDir(), fileName);
+    try {
+        await page.screenshot({ path: screenshotPath, fullPage: true });
+        console.log(`Saved screenshot to: ${screenshotPath}`);
+        return screenshotPath;
+    } catch (e) {
+        console.log('Failed to take screenshot:', e.message);
+        return null;
+    }
+}
+
 /**
  * 核心功能：遍历所有 Frames，查找被注入脚本标记的 Turnstile 坐标，
  * 计算绝对屏幕坐标，并使用 CDP 发送原生鼠标点击事件。
@@ -262,6 +284,86 @@ async function attemptTurnstileCdp(page) {
             // 忽略 Frame 访问错误（跨域等）
         }
     }
+    return false;
+}
+
+async function clickLocatorCenter(page, locator, logMessage) {
+    const box = await locator.boundingBox();
+    if (box) {
+        await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 8 });
+        await page.mouse.down();
+        await page.waitForTimeout(80 + Math.random() * 120);
+        await page.mouse.up();
+    } else {
+        await locator.click({ timeout: 2000 });
+    }
+    console.log(logMessage);
+    return true;
+}
+
+async function clickVisibleCaptchaCheckbox(page, modal) {
+    const frameSelectors = ['input[type="checkbox"]', '[role="checkbox"]'];
+    for (const frame of page.frames()) {
+        try {
+            for (const selector of frameSelectors) {
+                const checkbox = frame.locator(selector).first();
+                if (await checkbox.isVisible({ timeout: 500 })) {
+                    await checkbox.click({ timeout: 2000 });
+                    console.log('   >> Clicked visible captcha checkbox inside frame.');
+                    return true;
+                }
+            }
+        } catch (e) { }
+    }
+
+    const selectors = [
+        'input[type="checkbox"]',
+        'altcha-widget input[type="checkbox"]',
+        '[role="checkbox"]'
+    ];
+
+    for (const selector of selectors) {
+        try {
+            const checkbox = modal.locator(selector).first();
+            if (await checkbox.isVisible({ timeout: 1000 })) {
+                return await clickLocatorCenter(page, checkbox, '   >> Clicked visible captcha checkbox inside modal.');
+            }
+        } catch (e) { }
+    }
+
+    try {
+        const checkboxByRole = modal.getByRole('checkbox').first();
+        if (await checkboxByRole.isVisible({ timeout: 1000 })) {
+            return await clickLocatorCenter(page, checkboxByRole, '   >> Clicked captcha checkbox by role.');
+        }
+    } catch (e) { }
+
+    const widgetSelectors = ['altcha-widget', 'iframe[title*="captcha" i]', 'iframe'];
+    for (const selector of widgetSelectors) {
+        try {
+            const widget = modal.locator(selector).first();
+            if (await widget.isVisible({ timeout: 1000 })) {
+                const box = await widget.boundingBox();
+                if (!box) continue;
+                const clickX = box.x + Math.min(28, Math.max(18, box.width * 0.12));
+                const clickY = box.y + box.height / 2;
+                await page.mouse.move(clickX, clickY, { steps: 8 });
+                await page.mouse.down();
+                await page.waitForTimeout(80 + Math.random() * 120);
+                await page.mouse.up();
+                console.log('   >> Clicked captcha checkbox area by component coordinates.');
+                return true;
+            }
+        } catch (e) { }
+    }
+
+    try {
+        const text = modal.getByText("I'm not a robot", { exact: false }).first();
+        if (await text.isVisible({ timeout: 1000 })) {
+            return await clickLocatorCenter(page, text, '   >> Clicked captcha text area.');
+        }
+    } catch (e) { }
+
     return false;
 }
 
@@ -478,7 +580,14 @@ async function attemptTurnstileCdp(page) {
                         console.log('   >> CDP Click active. Waiting 8s for Cloudflare check...');
                         await page.waitForTimeout(8000);
                     } else {
-                        console.log('   >> Turnstile checkbox not confirmed after retries.');
+                        console.log('   >> Turnstile checkbox not confirmed after retries. Trying visible checkbox in current modal...');
+                        const checkboxClickResult = await clickVisibleCaptchaCheckbox(page, modal);
+                        if (checkboxClickResult) {
+                            console.log('   >> Visible checkbox click sent. Waiting 8s for verification...');
+                            await page.waitForTimeout(8000);
+                        } else {
+                            console.log('   >> Still could not find a clickable captcha checkbox in the current modal.');
+                        }
                     }
 
                     // C. 检查 Success 标志
@@ -515,7 +624,7 @@ async function attemptTurnstileCdp(page) {
                         await confirmBtn.click();
 
                         try {
-                            // 1. Check for "Please complete the captcha" error
+                            // 1. Check for captcha errors
                             const startVerifyTime = Date.now();
                             while (Date.now() - startVerifyTime < 3000) {
                                 // A. Captcha Error

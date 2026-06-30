@@ -1,4 +1,5 @@
 const { chromium } = require('playwright-extra');
+const { chromium: playwrightChromium } = require('playwright');
 const stealth = require('puppeteer-extra-plugin-stealth')();
 const axios = require('axios');
 const fs = require('fs');
@@ -44,8 +45,15 @@ async function sendTelegramMessage(message, imagePath = null) {
 // 启用 stealth 插件
 chromium.use(stealth);
 
-// GitHub Actions 环境下的 Chrome 路径 (通常是 google-chrome)
-const CHROME_PATH = process.env.CHROME_PATH || '/usr/bin/google-chrome';
+// GitHub Actions 环境下优先使用系统 Chrome；若不存在则自动回退到 Playwright 下载的 Chromium。
+const DEFAULT_CHROME_CANDIDATES = [
+    process.env.CHROME_PATH,
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser'
+].filter(Boolean);
+const DEBUG_HOST = '127.0.0.1';
 const DEBUG_PORT = 9222;
 
 // 确保 localhost 不走代理
@@ -157,12 +165,35 @@ async function checkProxy() {
 
 function checkPort(port) {
     return new Promise((resolve) => {
-        const req = http.get(`http://localhost:${port}/json/version`, (res) => {
-            resolve(true);
+        const req = http.get({ hostname: DEBUG_HOST, port, path: '/json/version', timeout: 2000 }, (res) => {
+            res.resume();
+            resolve(res.statusCode >= 200 && res.statusCode < 500);
+        });
+        req.on('timeout', () => {
+            req.destroy();
+            resolve(false);
         });
         req.on('error', () => resolve(false));
         req.end();
     });
+}
+
+function getChromeExecutablePath() {
+    const candidates = [...DEFAULT_CHROME_CANDIDATES];
+
+    try {
+        const playwrightPath = playwrightChromium.executablePath();
+        if (playwrightPath) candidates.push(playwrightPath);
+    } catch (e) {
+        console.log(`[Chrome] 获取 Playwright Chromium 路径失败: ${e.message}`);
+    }
+
+    for (const candidate of candidates) {
+        if (fs.existsSync(candidate)) return candidate;
+        console.log(`[Chrome] 候选路径不存在，跳过: ${candidate}`);
+    }
+
+    throw new Error(`未找到可用的 Chrome/Chromium。已检查: ${candidates.join(', ')}`);
 }
 
 async function launchChrome() {
@@ -172,42 +203,63 @@ async function launchChrome() {
         return;
     }
 
-    console.log(`正在启动 Chrome (路径: ${CHROME_PATH})...`);
+    const chromePath = getChromeExecutablePath();
+    console.log(`正在启动 Chrome (路径: ${chromePath})...`);
 
     const args = [
+        `--remote-debugging-address=${DEBUG_HOST}`,
         `--remote-debugging-port=${DEBUG_PORT}`,
         '--no-first-run',
         '--no-default-browser-check',
-        // '--headless=new', // (已被注释) 使用 xvfb-run 时不需要 headless 模式，这样可以模拟有头浏览器增加成功率
+        // '--headless=new', // 使用 xvfb-run 时不需要 headless 模式，这样可以模拟有头浏览器增加成功率
         '--disable-gpu',
         '--window-size=1280,720',
         '--no-sandbox',
         '--disable-setuid-sandbox',
-        '--user-data-dir=/tmp/chrome_user_data' // 必须指定用户数据目录，否则远程调试可能失败
+        '--user-data-dir=/tmp/chrome_user_data', // 必须指定用户数据目录，否则远程调试可能失败
+        '--disable-dev-shm-usage' // 避免共享内存不足
     ];
 
     if (PROXY_CONFIG) {
         args.push(`--proxy-server=${PROXY_CONFIG.server}`);
         args.push('--proxy-bypass-list=<-loopback>');
     }
-    // 添加针对 Linux 环境的额外稳定性参数
-    args.push('--disable-dev-shm-usage'); // 避免共享内存不足
 
-
-    const chrome = spawn(CHROME_PATH, args, {
+    const chrome = spawn(chromePath, args, {
         detached: true,
-        stdio: 'ignore'
+        stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    let chromeOutput = '';
+    const collectChromeOutput = (streamName, data) => {
+        const text = data.toString();
+        chromeOutput += `[${streamName}] ${text}`;
+        const trimmed = text.trim();
+        if (trimmed) console.log(`[Chrome ${streamName}] ${trimmed}`);
+        if (chromeOutput.length > 8000) chromeOutput = chromeOutput.slice(-8000);
+    };
+
+    chrome.stdout.on('data', data => collectChromeOutput('stdout', data));
+    chrome.stderr.on('data', data => collectChromeOutput('stderr', data));
+    chrome.on('error', err => {
+        console.error(`[Chrome] 启动进程失败: ${err.message}`);
+    });
+    chrome.on('exit', (code, signal) => {
+        if (code !== null || signal) console.log(`[Chrome] 进程退出: code=${code}, signal=${signal}`);
     });
     chrome.unref();
 
     console.log('正在等待 Chrome 初始化...');
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 30; i++) {
         if (await checkPort(DEBUG_PORT)) break;
         await new Promise(r => setTimeout(r, 1000));
     }
 
     if (!await checkPort(DEBUG_PORT)) {
         console.error('Chrome 无法在端口 ' + DEBUG_PORT + ' 上启动');
+        if (chromeOutput.trim()) {
+            console.error(`[Chrome] 最近输出:\n${chromeOutput.trim()}`);
+        }
         throw new Error('Chrome 启动失败');
     }
 }
@@ -224,6 +276,112 @@ function getUsers() {
         console.error('解析 USERS_JSON 环境变量错误:', e);
     }
     return [];
+}
+
+function ensureScreenshotDir() {
+    const photoDir = path.join(process.cwd(), 'screenshots');
+    if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
+    return photoDir;
+}
+
+function safeFileName(value) {
+    return String(value || 'unknown').replace(/[^a-z0-9]/gi, '_');
+}
+
+const RENEWAL_CACHE_PATH = process.env.RENEWAL_CACHE_PATH || path.join(process.cwd(), '.renewal-cache.json');
+const MONTHS = {
+    january: 0, jan: 0,
+    february: 1, feb: 1,
+    march: 2, mar: 2,
+    april: 3, apr: 3,
+    may: 4,
+    june: 5, jun: 5,
+    july: 6, jul: 6,
+    august: 7, aug: 7,
+    september: 8, sep: 8,
+    october: 9, oct: 9,
+    november: 10, nov: 10,
+    december: 11, dec: 11
+};
+
+function getUserCacheKey(index) {
+    return `user_${index + 1}`;
+}
+
+function loadRenewalCache() {
+    try {
+        if (!fs.existsSync(RENEWAL_CACHE_PATH)) return {};
+        const parsed = JSON.parse(fs.readFileSync(RENEWAL_CACHE_PATH, 'utf8'));
+        return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (e) {
+        console.log(`[缓存] 读取续期缓存失败，将忽略: ${e.message}`);
+        return {};
+    }
+}
+
+function saveRenewalCache(cache) {
+    try {
+        fs.writeFileSync(RENEWAL_CACHE_PATH, `${JSON.stringify(cache, null, 2)}\n`);
+        console.log(`[缓存] 续期缓存已保存: ${RENEWAL_CACHE_PATH}`);
+    } catch (e) {
+        console.log(`[缓存] 保存续期缓存失败: ${e.message}`);
+    }
+}
+
+function parseRenewalDate(dateStr, now = new Date()) {
+    const match = String(dateStr || '').trim().match(/^(\d{1,2})\s+([A-Za-z]+)(?:\s+(\d{4}))?$/);
+    if (!match) return null;
+
+    const day = Number(match[1]);
+    const month = MONTHS[match[2].toLowerCase()];
+    if (!Number.isInteger(day) || day < 1 || day > 31 || month === undefined) return null;
+
+    let year = match[3] ? Number(match[3]) : now.getUTCFullYear();
+    let candidate = new Date(Date.UTC(year, month, day, 0, 0, 0));
+    const todayUtc = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0));
+
+    // 站点只返回 "11 June" 这种无年份日期；如果已经是过去日期，按下一年处理。
+    if (!match[3] && candidate < todayUtc) {
+        year += 1;
+        candidate = new Date(Date.UTC(year, month, day, 0, 0, 0));
+    }
+
+    if (Number.isNaN(candidate.getTime())) return null;
+    return candidate.toISOString().slice(0, 10);
+}
+
+const MAX_RENEWAL_SKIP_DAYS = Number(process.env.MAX_RENEWAL_SKIP_DAYS || 7);
+
+function getDaysUntil(dateIso, now = new Date()) {
+    const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0));
+    const target = new Date(`${dateIso}T00:00:00.000Z`);
+    if (Number.isNaN(target.getTime())) return null;
+    return Math.ceil((target - today) / 86400000);
+}
+
+function shouldSkipUntilRenewalDate(cacheEntry, now = new Date()) {
+    if (!cacheEntry || !cacheEntry.nextRenewalDate) return false;
+    const daysUntil = getDaysUntil(cacheEntry.nextRenewalDate, now);
+    if (daysUntil === null) return false;
+    if (daysUntil <= 0) return false;
+    if (daysUntil > MAX_RENEWAL_SKIP_DAYS) {
+        console.log(`[缓存] 缓存日期 ${cacheEntry.nextRenewalDate} 距今 ${daysUntil} 天，超过上限 ${MAX_RENEWAL_SKIP_DAYS} 天，将忽略并按每日检查执行。`);
+        return false;
+    }
+    return true;
+}
+
+async function saveScreenshot(page, fileName) {
+    const photoDir = ensureScreenshotDir();
+    const screenshotPath = path.join(photoDir, fileName);
+    try {
+        await page.screenshot({ path: screenshotPath, fullPage: true });
+        console.log(`截图已保存至: ${screenshotPath}`);
+        return screenshotPath;
+    } catch (e) {
+        console.log('截图失败:', e.message);
+        return null;
+    }
 }
 
 async function attemptTurnstileCdp(page) {
@@ -275,6 +433,86 @@ async function attemptTurnstileCdp(page) {
     return false;
 }
 
+async function clickLocatorCenter(page, locator, logMessage) {
+    const box = await locator.boundingBox();
+    if (box) {
+        await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 8 });
+        await page.mouse.down();
+        await page.waitForTimeout(80 + Math.random() * 120);
+        await page.mouse.up();
+    } else {
+        await locator.click({ timeout: 2000 });
+    }
+    console.log(logMessage);
+    return true;
+}
+
+async function clickVisibleCaptchaCheckbox(page, modal) {
+    const frameSelectors = ['input[type="checkbox"]', '[role="checkbox"]'];
+    for (const frame of page.frames()) {
+        try {
+            for (const selector of frameSelectors) {
+                const checkbox = frame.locator(selector).first();
+                if (await checkbox.isVisible({ timeout: 500 })) {
+                    await checkbox.click({ timeout: 2000 });
+                    console.log('   >> 已点击 frame 内可见 Captcha 复选框。');
+                    return true;
+                }
+            }
+        } catch (e) { }
+    }
+
+    const selectors = [
+        'input[type="checkbox"]',
+        'altcha-widget input[type="checkbox"]',
+        '[role="checkbox"]'
+    ];
+
+    for (const selector of selectors) {
+        try {
+            const checkbox = modal.locator(selector).first();
+            if (await checkbox.isVisible({ timeout: 1000 })) {
+                return await clickLocatorCenter(page, checkbox, '   >> 已点击模态框内可见 Captcha 复选框。');
+            }
+        } catch (e) { }
+    }
+
+    try {
+        const checkboxByRole = modal.getByRole('checkbox').first();
+        if (await checkboxByRole.isVisible({ timeout: 1000 })) {
+            return await clickLocatorCenter(page, checkboxByRole, '   >> 已按角色点击 Captcha 复选框。');
+        }
+    } catch (e) { }
+
+    const widgetSelectors = ['altcha-widget', 'iframe[title*="captcha" i]', 'iframe'];
+    for (const selector of widgetSelectors) {
+        try {
+            const widget = modal.locator(selector).first();
+            if (await widget.isVisible({ timeout: 1000 })) {
+                const box = await widget.boundingBox();
+                if (!box) continue;
+                const clickX = box.x + Math.min(28, Math.max(18, box.width * 0.12));
+                const clickY = box.y + box.height / 2;
+                await page.mouse.move(clickX, clickY, { steps: 8 });
+                await page.mouse.down();
+                await page.waitForTimeout(80 + Math.random() * 120);
+                await page.mouse.up();
+                console.log('   >> 已按 Captcha 组件坐标点击复选框区域。');
+                return true;
+            }
+        } catch (e) { }
+    }
+
+    try {
+        const text = modal.getByText("I'm not a robot", { exact: false }).first();
+        if (await text.isVisible({ timeout: 1000 })) {
+            return await clickLocatorCenter(page, text, '   >> 已点击 Captcha 文本区域。');
+        }
+    } catch (e) { }
+
+    return false;
+}
+
 (async () => {
     const users = getUsers();
     if (users.length === 0) {
@@ -296,7 +534,7 @@ async function attemptTurnstileCdp(page) {
     let browser;
     for (let k = 0; k < 5; k++) {
         try {
-            browser = await chromium.connectOverCDP(`http://localhost:${DEBUG_PORT}`);
+            browser = await chromium.connectOverCDP(`http://${DEBUG_HOST}:${DEBUG_PORT}`);
             console.log('连接成功！');
             break;
         } catch (e) {
@@ -313,6 +551,8 @@ async function attemptTurnstileCdp(page) {
     const context = browser.contexts()[0];
     let page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
     page.setDefaultTimeout(60000);
+    let hasFailure = false;
+    const renewalCache = loadRenewalCache();
 
     if (PROXY_CONFIG && PROXY_CONFIG.username) {
         console.log('[代理] 正在设置认证...');
@@ -329,7 +569,16 @@ async function attemptTurnstileCdp(page) {
 
     for (let i = 0; i < users.length; i++) {
         const user = users[i];
+        const safeUsername = safeFileName(user.username);
+        const cacheKey = getUserCacheKey(i);
+        const cacheEntry = renewalCache[cacheKey];
         console.log(`\n=== 正在处理用户 ${i + 1}/${users.length} ===`); // 隐去具体邮箱 logging
+
+        if (shouldSkipUntilRenewalDate(cacheEntry)) {
+            console.log(`[缓存] 当前未到站点返回的下次可续期日期 ${cacheEntry.nextRenewalDate}，跳过本次运行。`);
+            await sendTelegramMessage(`⏳ *续期暂缓*\n用户: ${user.username}\n原因: 未到站点返回的下次可续期日期\n下次可用: ${cacheEntry.nextRenewalDate}`);
+            continue;
+        }
 
         try {
             if (page.isClosed()) {
@@ -404,8 +653,8 @@ async function attemptTurnstileCdp(page) {
                     const errorMsg = page.getByText('Incorrect password or no account');
                     if (await errorMsg.isVisible({ timeout: 3000 })) {
                         console.error(`   >> ❌ 登录失败: 用户 ${user.username} 账号或密码错误`);
-                        const failShotPath = path.join(photoDir, `${safeUsername}.png`);
-                        try { await page.screenshot({ path: failShotPath, fullPage: true }); } catch (e) { }
+                        hasFailure = true;
+                        const failShotPath = await saveScreenshot(page, `${safeUsername}_login_failed.png`);
 
                         await sendTelegramMessage(`❌ *登录失败*\n用户: ${user.username}\n原因: 账号或密码错误`, failShotPath);
 
@@ -429,6 +678,7 @@ async function attemptTurnstileCdp(page) {
 
             // --- Renew 逻辑 ---
             let renewSuccess = false;
+            let failureReported = false;
             // 2. 一个扁平化的主循环：尝试 Renew 整个流程 (最多 20 次)
             for (let attempt = 1; attempt <= 20; attempt++) {
                 let hasCaptchaError = false;
@@ -474,7 +724,14 @@ async function attemptTurnstileCdp(page) {
                         console.log('   >> CDP 点击生效。等待 8秒 Cloudflare 检查...');
                         await page.waitForTimeout(8000);
                     } else {
-                        console.log('   >> 重试后仍未确认 Turnstile 复选框。');
+                        console.log('   >> 重试后仍未确认 Turnstile 复选框，尝试识别当前模态框内可见复选框...');
+                        const checkboxClickResult = await clickVisibleCaptchaCheckbox(page, modal);
+                        if (checkboxClickResult) {
+                            console.log('   >> 可见复选框点击已发送。等待 8秒验证...');
+                            await page.waitForTimeout(8000);
+                        } else {
+                            console.log('   >> 当前模态框内仍未找到可点击的 Captcha 复选框。');
+                        }
                     }
 
                     // C. 检查 Success 标志
@@ -496,16 +753,8 @@ async function attemptTurnstileCdp(page) {
                     if (await confirmBtn.isVisible()) {
 
                         // User Requested: Screenshot BEFORE final click
-                        const fs = require('fs');
-                        const path = require('path');
-                        const photoDir = path.join(process.cwd(), 'screenshots');
-                        if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
-                        const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
-                        const tsScreenshotName = `${safeUser}_Turnstile_${attempt}.png`;
-                        try {
-                            await page.screenshot({ path: path.join(photoDir, tsScreenshotName), fullPage: true });
-                            console.log(`   >> 📸 快照已保存: ${tsScreenshotName}`);
-                        } catch (e) { }
+                        const tsScreenshotName = `${safeUsername}_Turnstile_${attempt}.png`;
+                        await saveScreenshot(page, tsScreenshotName);
 
                         // User Request: 找不到的话这个循环直接下一步点击renew，然后检测有没有Please complete the captcha to continue
                         console.log('   >> 点击 Renew 确认按钮 (无论 Turnstile 状态如何)...');
@@ -528,18 +777,25 @@ async function attemptTurnstileCdp(page) {
                                     const text = await notTimeLoc.innerText();
                                     const match = text.match(/as of\s+(.*?)\s+\(/);
                                     let dateStr = match ? match[1] : 'Unknown Date';
-                                    console.log(`   >> ⏳ 暂无法续期。下次可用时间: ${dateStr}`);
+                                    const nextRenewalDate = parseRenewalDate(dateStr);
+                                    console.log(`   >> ⏳ 暂无法续期。下次可用时间: ${dateStr}${nextRenewalDate ? ` (${nextRenewalDate})` : ''}`);
+
+                                    if (nextRenewalDate) {
+                                        renewalCache[cacheKey] = {
+                                            nextRenewalDate,
+                                            rawDate: dateStr,
+                                            updatedAt: new Date().toISOString()
+                                        };
+                                        saveRenewalCache(renewalCache);
+                                    } else {
+                                        delete renewalCache[cacheKey];
+                                        saveRenewalCache(renewalCache);
+                                    }
 
                                     // 截图证明
-                                    const fs = require('fs');
-                                    const path = require('path');
-                                    const photoDir = path.join(process.cwd(), 'screenshots');
-                                    if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
-                                    const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
-                                    const skipShotPath = path.join(photoDir, `${safeUser}_skip.png`);
-                                    try { await page.screenshot({ path: skipShotPath, fullPage: true }); } catch (e) { }
+                                    const skipShotPath = await saveScreenshot(page, `${safeUsername}_skip.png`);
 
-                                    await sendTelegramMessage(`⏳ *暂无法续期 (跳过)*\n用户: ${user.username}\n原因: 还没到时间\n下次可用: ${dateStr}`, skipShotPath);
+                                    await sendTelegramMessage(`⏳ *暂无法续期 (跳过)*\n用户: ${user.username}\n原因: 还没到时间\n下次可用: ${nextRenewalDate || dateStr}`, skipShotPath);
 
                                     renewSuccess = true; // Mark as done to stop retries
                                     try {
@@ -567,13 +823,7 @@ async function attemptTurnstileCdp(page) {
                             console.log('   >> ✅ Modal closed. Renew successful!');
 
                             // 截图成功状态
-                            const fs = require('fs');
-                            const path = require('path');
-                            const photoDir = path.join(process.cwd(), 'screenshots');
-                            if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
-                            const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
-                            const successShotPath = path.join(photoDir, `${safeUser}_success.png`);
-                            try { await page.screenshot({ path: successShotPath, fullPage: true }); } catch (e) { }
+                            const successShotPath = await saveScreenshot(page, `${safeUsername}_success.png`);
 
                             await sendTelegramMessage(`✅ *续期成功*\n用户: ${user.username}\n状态: 服务器已成功续期！`, successShotPath);
                             renewSuccess = true;
@@ -596,27 +846,35 @@ async function attemptTurnstileCdp(page) {
                     break;
                 }
             }
+
+            if (!renewSuccess && !failureReported) {
+                hasFailure = true;
+                const failShotPath = await saveScreenshot(page, `${safeUsername}_renew_failed.png`);
+                await sendTelegramMessage(
+                    `❌ *续期失败*\n用户: ${user.username}\n原因: 未能确认续期成功。请查看截图和 Actions 日志。`,
+                    failShotPath
+                );
+            }
         } catch (err) {
             console.error(`Error processing user:`, err);
+            hasFailure = true;
+            const errorShotPath = await saveScreenshot(page, `${safeUsername}_error.png`);
+            await sendTelegramMessage(
+                `❌ *处理失败*\n用户: ${user.username}\n原因: 脚本异常: ${err.message}`,
+                errorShotPath
+            );
         }
 
         // Snapshot before handling next user
-        // In GitHub Actions, we save to 'screenshots' dir
-        const fs = require('fs');
-        const path = require('path');
-        const photoDir = path.join(process.cwd(), 'screenshots');
-        if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
-        // Use safe filename
-        const safeUsername = user.username.replace(/[^a-z0-9]/gi, '_');
-        const screenshotPath = path.join(photoDir, `${safeUsername}.png`);
-        try {
-            await page.screenshot({ path: screenshotPath, fullPage: true });
-            console.log(`截图已保存至: ${screenshotPath}`);
-        } catch (e) {
-            console.log('截图失败:', e.message);
-        }
+        await saveScreenshot(page, `${safeUsername}.png`);
 
         console.log(`用户处理完成\n`);
+    }
+
+    if (hasFailure) {
+        console.error('完成，但存在处理失败的用户。退出码 1，避免 GitHub Actions 假成功。');
+        await browser.close();
+        process.exit(1);
     }
 
     console.log('完成。');

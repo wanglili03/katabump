@@ -5,3 +5,4 @@ ChromeData_Katabump/
 *.log
 .DS_Store
 photo/
+.renewal-cache.json
